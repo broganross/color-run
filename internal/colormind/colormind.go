@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/rs/zerolog/log"
 )
@@ -27,10 +28,6 @@ var (
 
 	emptyBytes = [...]byte{101, 109, 112, 116, 121, 32, 98, 111, 100, 121, 10}
 )
-
-type listModelResult struct {
-	Result []string `json:"result"`
-}
 
 type Color color.RGBA
 
@@ -96,27 +93,22 @@ func (p *Palette) MarshalJSON() ([]byte, error) {
 type ColorMind struct {
 	URL    string
 	Client *http.Client
-	Ctx    context.Context
 }
 
 func New() *ColorMind {
 	return &ColorMind{
 		URL:    "http://colormind.io",
 		Client: http.DefaultClient,
-		Ctx:    context.Background(),
 	}
 }
 
-type getPaletteRequest struct {
-	Model string   `json:"model"`
-	Input *Palette `json:"input,omitempty"`
-}
-
-type getPaletteResponse struct {
-	Result Palette `json:"result"`
-}
-
 func (c *ColorMind) GetPalette(model string, p *Palette) (*Palette, error) {
+	return c.GetPaletteWithContext(context.Background(), model, p)
+}
+
+func (c *ColorMind) GetPaletteWithContext(ctx context.Context, model string, p *Palette) (*Palette, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	// if given a palette it must contain at least one color
 	if p != nil {
 		cnt := 0
@@ -138,7 +130,7 @@ func (c *ColorMind) GetPalette(model string, p *Palette) (*Palette, error) {
 		return nil, fmt.Errorf("marshaling request body: %w", err)
 	}
 	body := bytes.NewBuffer(contents)
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/api/", c.URL), body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("%s/api/", c.URL), body)
 	if err != nil {
 		return nil, fmt.Errorf("making request: %w", err)
 	}
@@ -176,7 +168,13 @@ func (c *ColorMind) GetPalette(model string, p *Palette) (*Palette, error) {
 }
 
 func (c *ColorMind) ListModels() ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/list", c.URL), nil)
+	return c.ListModelsWithContext(context.Background())
+}
+
+func (c *ColorMind) ListModelsWithContext(ctx context.Context) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/list", c.URL), nil)
 	if err != nil {
 		return nil, fmt.Errorf("making request: %w", err)
 	}
@@ -201,7 +199,7 @@ func (c *ColorMind) ListModels() ([]string, error) {
 		}
 		return nil, fmt.Errorf("%w (%s): %s", ErrResponseStatus, http.StatusText(resp.StatusCode), contents)
 	}
-	results := listModelResult{}
+	results := listModelResponse{}
 	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrParseBody, err)
 	}
