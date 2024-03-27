@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"slices"
 	"time"
-
-	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -51,7 +49,6 @@ func (c *Color) Marshal() ([]byte, error) {
 type Palette [5]*color.RGBA
 
 func (p *Palette) UnmarshalJSON(b []byte) error {
-	log.Info().Msg(string(b))
 	values := [5][3]uint8{}
 	if err := json.Unmarshal(b, &values); err != nil {
 		return err
