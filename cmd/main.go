@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -22,7 +23,9 @@ import (
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
+var Version = "development"
 var ErrInputClosed = errors.New("input channel has been closed")
+var errFfmpegExit = errors.New("ffmpeg errorred")
 
 type ingestsResponse struct {
 	Ingests []struct {
@@ -36,10 +39,10 @@ type ingestsResponse struct {
 }
 
 type ffmpegInput struct {
-	Channel   chan []byte
-	ImageSize int
-	image     []byte
-	idx       int
+	ColorChannel chan *color.RGBA
+	ImageSize    int
+	col          *color.RGBA
+	idx          int
 }
 
 func (fi *ffmpegInput) Read(p []byte) (int, error) {
@@ -47,18 +50,25 @@ func (fi *ffmpegInput) Read(p []byte) (int, error) {
 	l := len(p)
 	end := false
 	for {
-		if fi.image == nil {
-			frame, ok := <-fi.Channel
+		if fi.col == nil {
+			col, ok := <-fi.ColorChannel
 			if !ok {
 				end = true
 			}
-			fi.image = frame
+			fi.col = col
 		}
-		n := copy(p[cnt:], fi.image[fi.idx:])
+		n := 0
+		for i, j := fi.idx, cnt; i < fi.ImageSize*4 && j < l; i, j = i+1, j+4 {
+			p[j] = fi.col.R
+			p[j+1] = fi.col.G
+			p[j+2] = fi.col.B
+			p[j+3] = fi.col.A
+			n += 4
+		}
 		fi.idx += n
 		cnt += n
-		if fi.idx >= len(fi.image) {
-			fi.image = nil
+		if fi.idx >= fi.ImageSize*4 {
+			fi.col = nil
 			fi.idx = 0
 		}
 		if cnt >= l {
@@ -125,6 +135,7 @@ func main() {
 	transitionFrames := flag.Int("f", 90, "number of frames to transition from one color to another")
 	randomModel := flag.Bool("r", false, "use a random color mind model")
 	streamKey := flag.String("k", "", "twitch stream key")
+	dumpDir := flag.String("d", "", "dump frames to this directory as well as streaming")
 	flag.Parse()
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
@@ -133,13 +144,12 @@ func main() {
 	defer stop()
 
 	colorChanSize := 15
-	colorChannel := make(chan *color.RGBA, 15)
+	// color palette channel
+	colorChannel := make(chan *color.RGBA, colorChanSize)
 	errorChannel := make(chan error, 5)
+	// frame color channel
+	frameChannel := make(chan *color.RGBA, *transitionFrames*3)
 	httpClient := &http.Client{}
-	imageSize := *width * *height
-	imageChanSize := imageSize * 4 * *transitionFrames
-	// this is for sending each image
-	imageChannel := make(chan []byte, imageChanSize)
 
 	// creates the color mind client and retrieves a random color palette
 	cm := colormind.New()
@@ -153,7 +163,7 @@ func main() {
 		}
 		colorModel = models[rand.Intn(len(models))]
 	}
-	// get palletes as long as we need to
+	// get palettes as long as we need to
 	go func() {
 		start := 0
 		slowCount := colorChanSize / 3
@@ -196,20 +206,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	input := &ffmpegInput{Channel: imageChannel}
+	imageSize := *width * *height
+	input := &ffmpegInput{
+		ColorChannel: frameChannel,
+		ImageSize:    imageSize,
+	}
+	outPath := ingestURL
+	format := "flv"
+	if *dumpDir != "" {
+		format = "mov"
+		outPath = filepath.Join(*dumpDir, "out.mov")
+	}
+
 	proc := ffmpeg.Input("pipe:0", ffmpeg.KwArgs{
 		"f":          "rawvideo",
 		"pix_fmt":    "rgba",
 		"video_size": fmt.Sprintf("%dx%d", *width, *height),
 	}).
 		WithInput(input).
-		Output(ingestURL, ffmpeg.KwArgs{
+		Output(outPath, ffmpeg.KwArgs{
 			"framerate": 30,
 			"c:v":       "libx264",
 			"preset":    "veryfast",
-			"f":         "flv",
+			"f":         format,
 		}).
-		SetFfmpegPath("C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe").
 		ErrorToStdOut().
 		Compile()
 	if err := proc.Start(); err != nil {
@@ -217,6 +237,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	go func() {
+		// gotta figure out how to make this exit if ffmpeg fails
+		if err := proc.Wait(); err != nil {
+			errorChannel <- fmt.Errorf("%w: %w", errFfmpegExit, err)
+		}
+	}()
 	go func() {
 		var left *color.RGBA
 		var right *color.RGBA
@@ -237,30 +263,18 @@ func main() {
 				right = r
 			}
 			log.Debug().Msg("got left and right")
-			stride := *width * 4
 			for frame := 0; frame < *transitionFrames; frame++ {
 				ratio := float32(frame) / float32(*transitionFrames)
 				color := lerp(left, right, ratio)
-				image := make([]byte, imageSize*4)
-				for x := 0; x < *width; x++ {
-					for y := 0; y < *height; y++ {
-						pos := y*stride + x*4
-						image[pos] = color.R
-						image[pos+1] = color.G
-						image[pos+2] = color.B
-						image[pos+3] = color.A
-					}
-				}
-				imageChannel <- image
+				frameChannel <- color
 			}
-
 			left = right
 			right = nil
 			if done {
 				break
 			}
 		}
-		close(imageChannel)
+		close(frameChannel)
 	}()
 
 	for {
@@ -272,14 +286,15 @@ func main() {
 			done = true
 		case err := <-errorChannel:
 			log.Error().Err(err).Send()
+			if errors.Is(err, errFfmpegExit) {
+				stop()
+				done = true
+			}
 		}
 		if done {
 			break
 		}
 	}
-	if err := proc.Wait(); err != nil {
-		log.Error().Err(err).Msg("waiting for ffmpeg")
-		os.Exit(1)
-	}
+
 	os.Exit(0)
 }
