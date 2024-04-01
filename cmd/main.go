@@ -6,7 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"image/color"
+	"image"
 	"io"
 	"math/rand"
 	"net/http"
@@ -19,6 +19,7 @@ import (
 
 	"github.com/broganross/color-run/internal/colormind"
 	"github.com/broganross/color-run/internal/config"
+	"github.com/broganross/color-run/internal/frame"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -41,9 +42,8 @@ type ingestsResponse struct {
 }
 
 type ffmpegInput struct {
-	ColorChannel chan *color.RGBA
-	ImageSize    int
-	col          *color.RGBA
+	ImageChannel chan *image.RGBA
+	img          *image.RGBA
 	idx          int
 }
 
@@ -52,25 +52,26 @@ func (fi *ffmpegInput) Read(p []byte) (int, error) {
 	l := len(p)
 	end := false
 	for {
-		if fi.col == nil {
-			col, ok := <-fi.ColorChannel
+		if fi.img == nil {
+			img, ok := <-fi.ImageChannel
 			if !ok {
 				end = true
 			}
-			fi.col = col
+			fi.img = img
 		}
 		n := 0
-		for i, j := fi.idx, cnt; i < fi.ImageSize*4 && j < l; i, j = i+1, j+4 {
-			p[j] = fi.col.R
-			p[j+1] = fi.col.G
-			p[j+2] = fi.col.B
-			p[j+3] = fi.col.A
+		imageSize := fi.img.Rect.Dx() * fi.img.Rect.Dy() * 4
+		for i, j := fi.idx, cnt; i < imageSize && j < l; i, j = i+4, j+4 {
+			p[j] = fi.img.Pix[i]
+			p[j+1] = fi.img.Pix[i+1]
+			p[j+2] = fi.img.Pix[i+2]
+			p[j+3] = fi.img.Pix[i+3]
 			n += 4
 		}
 		fi.idx += n
 		cnt += n
-		if fi.idx >= fi.ImageSize*4 {
-			fi.col = nil
+		if fi.idx >= imageSize {
+			fi.img = nil
 			fi.idx = 0
 		}
 		if cnt >= l {
@@ -121,14 +122,13 @@ func getIngestURL(ctx context.Context, client *http.Client, streamKey string) (s
 	return ingestURL, nil
 }
 
-// Linearly interpolate between two colors.
-func lerp(c1 *color.RGBA, c2 *color.RGBA, ratio float32) *color.RGBA {
-	return &color.RGBA{
-		uint8(float32(c1.R)*(1.0-ratio) + float32(c2.R)*ratio),
-		uint8(float32(c1.G)*(1.0-ratio) + float32(c2.G)*ratio),
-		uint8(float32(c1.B)*(1.0-ratio) + float32(c2.B)*ratio),
-		uint8(float32(c1.A)*(1.0-ratio) + float32(c2.A)*ratio),
-	}
+type errorOut struct{}
+
+func (eo *errorOut) Write(p []byte) (int, error) {
+	os.Stderr.Write([]byte("Error: "))
+	n, err := os.Stderr.Write(p)
+	os.Stderr.Write([]byte("\n"))
+	return n, err
 }
 
 func main() {
@@ -155,10 +155,9 @@ func main() {
 
 	colorChanSize := 15
 	// color palette channel
-	colorChannel := make(chan *color.RGBA, colorChanSize)
 	errorChannel := make(chan error, 5)
 	// frame color channel
-	frameChannel := make(chan *color.RGBA, conf.FrameCount*3)
+	frameChannel := make(chan *image.RGBA, conf.FrameCount*3)
 	httpClient := &http.Client{}
 
 	// creates the color mind client and retrieves a random color palette
@@ -173,42 +172,7 @@ func main() {
 		}
 		colorModel = models[rand.Intn(len(models))]
 	}
-	// get palettes as long as we need to
-	go func() {
-		start := 0
-		slowCount := colorChanSize / 3
-		var previous *colormind.Palette
-		stop := false
-		for {
-			pal, err := cm.GetPaletteWithContext(ctx, colorModel, previous)
-			if err != nil {
-				errorChannel <- fmt.Errorf("getting palette: %w", err)
-				continue
-			}
-			log.Debug().Any("palette", pal).Msg("got palette")
-			for i := start; i < len(pal); i++ {
-				select {
-				case colorChannel <- pal[i]:
-				case <-ctx.Done():
-					stop = true
-				}
-			}
-			if previous == nil {
-				previous = &colormind.Palette{}
-				start = 2
-			}
-			previous[0] = pal[3]
-			previous[1] = pal[4]
-			if slowCount > 0 {
-				time.Sleep(2 * time.Second)
-				slowCount--
-			}
-			if stop {
-				break
-			}
-		}
-		close(colorChannel)
-	}()
+	colorChannel, colErrChan := colormind.PaletteQueue(ctx, colorModel, cm, colorChanSize)
 
 	ingestURL, err := getIngestURL(ctx, httpClient, conf.StreamKey)
 	if err != nil {
@@ -216,10 +180,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	imageSize := conf.ImageWidth * conf.ImageHeight
 	input := &ffmpegInput{
-		ColorChannel: frameChannel,
-		ImageSize:    imageSize,
+		ImageChannel: frameChannel,
 	}
 	outPath := ingestURL
 	if conf.DumpDir != "" {
@@ -239,7 +201,8 @@ func main() {
 			"preset":    "veryfast",
 			"f":         "flv",
 		}).
-		ErrorToStdOut().
+		WithOutput(os.Stdout).
+		WithErrorOutput(&errorOut{}).
 		Compile()
 
 	if err != nil {
@@ -254,41 +217,15 @@ func main() {
 		// ffmpeg has inconsitent exit codes, TODO: figure out a way to handle this so that we stop when ffmpeg fails
 		log.Info().Int("exit-code", proc.ProcessState.ExitCode()).Msg("ffmpeg exited")
 		errorChannel <- errFfmpegExit
-
 	}()
-	go func() {
-		var left *color.RGBA
-		var right *color.RGBA
-		done := false
-		for {
-			if left == nil {
-				l, ok := <-colorChannel
-				if !ok {
-					done = true
-				}
-				left = l
-			}
-			if right == nil {
-				r, ok := <-colorChannel
-				if !ok {
-					done = true
-				}
-				right = r
-			}
-			log.Debug().Msg("got left and right")
-			for frame := 0; frame < conf.FrameCount; frame++ {
-				ratio := float32(frame) / float32(conf.FrameCount)
-				color := lerp(left, right, ratio)
-				frameChannel <- color
-			}
-			left = right
-			right = nil
-			if done {
-				break
-			}
-		}
-		close(frameChannel)
-	}()
+	frameMaker := frame.LinearGradientTransition{
+		ImageWidth:   conf.ImageWidth,
+		ImageHeight:  conf.ImageHeight,
+		Transition:   conf.FrameCount,
+		ColorChannel: colorChannel,
+		ImageChannel: frameChannel,
+	}
+	go frameMaker.Run()
 
 	for {
 		done := false
@@ -303,6 +240,8 @@ func main() {
 				stop()
 				done = true
 			}
+		case err := <-colErrChan:
+			log.Error().Err(err).Send()
 		}
 		if done {
 			break

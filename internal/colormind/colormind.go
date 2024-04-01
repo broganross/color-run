@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"slices"
 	"time"
+
+	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -201,4 +203,45 @@ func (c *ColorMind) ListModelsWithContext(ctx context.Context) ([]string, error)
 		return nil, fmt.Errorf("%w: %w", ErrParseBody, err)
 	}
 	return results.Result, nil
+}
+
+func PaletteQueue(ctx context.Context, model string, cm *ColorMind, chanSize int) (chan *color.RGBA, chan error) {
+	start := 0
+	slowCount := chanSize / 3
+	var previous *Palette
+	stop := false
+	errorChannel := make(chan error, 5)
+	colorChannel := make(chan *color.RGBA, chanSize)
+	go func() {
+		for {
+			pal, err := cm.GetPaletteWithContext(ctx, model, previous)
+			if err != nil {
+				errorChannel <- fmt.Errorf("getting palette: %w", err)
+			}
+			log.Debug().Any("palette", pal).Msg("got palette")
+			for i := start; i < len(pal); i++ {
+				select {
+				case colorChannel <- pal[i]:
+				case <-ctx.Done():
+					stop = true
+				}
+			}
+			if previous == nil {
+				previous = &Palette{}
+				start = 2
+			}
+			previous[0] = pal[3]
+			previous[1] = pal[4]
+			if slowCount > 0 {
+				time.Sleep(2 * time.Second)
+				slowCount--
+			}
+			if stop {
+				break
+			}
+		}
+		close(colorChannel)
+	}()
+	return colorChannel, errorChannel
+
 }
