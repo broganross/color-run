@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/broganross/color-run/internal/colormind"
+	"github.com/broganross/color-run/internal/config"
+	"github.com/kelseyhightower/envconfig"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	ffmpeg "github.com/u2takey/ffmpeg-go"
@@ -130,13 +132,21 @@ func lerp(c1 *color.RGBA, c2 *color.RGBA, ratio float32) *color.RGBA {
 }
 
 func main() {
-	width := flag.Int("w", 1280, "image width")
-	height := flag.Int("h", 720, "image height")
-	transitionFrames := flag.Int("f", 90, "number of frames to transition from one color to another")
-	randomModel := flag.Bool("r", false, "use a random color mind model")
-	streamKey := flag.String("k", "", "twitch stream key")
-	dumpDir := flag.String("d", "", "dump frames to this directory as well as streaming")
+	conf := config.Config{}
+	if err := envconfig.Process("colorrun", &conf); err != nil {
+		log.Error().Err(err).Msg("parsing environment variables")
+		os.Exit(1)
+	}
+	flag.IntVar(&conf.ImageWidth, "w", conf.ImageWidth, "image width")
+	flag.IntVar(&conf.ImageHeight, "h", conf.ImageHeight, "image height")
+	flag.IntVar(&conf.FrameCount, "f", conf.FrameCount, "number of frames to transition from one color to another")
+	flag.BoolVar(&conf.RandomModel, "r", conf.RandomModel, "use a random color mind model")
+	flag.StringVar(&conf.StreamKey, "k", conf.StreamKey, "twitch stream key")
+	flag.StringVar(&conf.DumpDir, "d", conf.DumpDir, "dump frames to this directory as well as streaming")
 	flag.Parse()
+	if conf.StreamKey == "" {
+		log.Fatal().Msg("stream key not set")
+	}
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
 	ctx := context.Background()
@@ -148,14 +158,14 @@ func main() {
 	colorChannel := make(chan *color.RGBA, colorChanSize)
 	errorChannel := make(chan error, 5)
 	// frame color channel
-	frameChannel := make(chan *color.RGBA, *transitionFrames*3)
+	frameChannel := make(chan *color.RGBA, conf.FrameCount*3)
 	httpClient := &http.Client{}
 
 	// creates the color mind client and retrieves a random color palette
 	cm := colormind.New()
 	cm.Client = httpClient
 	colorModel := "default"
-	if *randomModel {
+	if conf.RandomModel {
 		models, err := cm.ListModelsWithContext(ctx)
 		if err != nil {
 			log.Error().Err(err).Msg("getting color mind models")
@@ -200,48 +210,51 @@ func main() {
 		close(colorChannel)
 	}()
 
-	ingestURL, err := getIngestURL(ctx, httpClient, *streamKey)
+	ingestURL, err := getIngestURL(ctx, httpClient, conf.StreamKey)
 	if err != nil {
 		log.Error().Err(err).Msg("getting ingest URL")
 		os.Exit(1)
 	}
 
-	imageSize := *width * *height
+	imageSize := conf.ImageWidth * conf.ImageHeight
 	input := &ffmpegInput{
 		ColorChannel: frameChannel,
 		ImageSize:    imageSize,
 	}
 	outPath := ingestURL
-	format := "flv"
-	if *dumpDir != "" {
-		format = "mov"
-		outPath = filepath.Join(*dumpDir, "out.mov")
+	if conf.DumpDir != "" {
+		outPath = filepath.Join(conf.DumpDir, "out.flv")
 	}
 
-	proc := ffmpeg.Input("pipe:0", ffmpeg.KwArgs{
-		"f":          "rawvideo",
-		"pix_fmt":    "rgba",
-		"video_size": fmt.Sprintf("%dx%d", *width, *height),
-	}).
+	proc := ffmpeg.
+		Input("pipe:0", ffmpeg.KwArgs{
+			"f":          "rawvideo",
+			"pix_fmt":    "rgba",
+			"video_size": fmt.Sprintf("%dx%d", conf.ImageWidth, conf.ImageHeight),
+		}).
 		WithInput(input).
 		Output(outPath, ffmpeg.KwArgs{
 			"framerate": 30,
 			"c:v":       "libx264",
 			"preset":    "veryfast",
-			"f":         format,
+			"f":         "flv",
 		}).
 		ErrorToStdOut().
 		Compile()
-	if err := proc.Start(); err != nil {
-		log.Error().Err(err).Msg("starting ffmpeg")
-		os.Exit(1)
-	}
 
+	if err != nil {
+		log.Error().Err(err).Msg("getting stderr pipe")
+		os.Exit(10)
+	}
 	go func() {
-		// gotta figure out how to make this exit if ffmpeg fails
-		if err := proc.Wait(); err != nil {
+		log.Info().Msg("waiting for ffmpeg")
+		if err := proc.Run(); err != nil {
 			errorChannel <- fmt.Errorf("%w: %w", errFfmpegExit, err)
 		}
+		// ffmpeg has inconsitent exit codes, TODO: figure out a way to handle this so that we stop when ffmpeg fails
+		log.Info().Int("exit-code", proc.ProcessState.ExitCode()).Msg("ffmpeg exited")
+		errorChannel <- errFfmpegExit
+
 	}()
 	go func() {
 		var left *color.RGBA
@@ -263,8 +276,8 @@ func main() {
 				right = r
 			}
 			log.Debug().Msg("got left and right")
-			for frame := 0; frame < *transitionFrames; frame++ {
-				ratio := float32(frame) / float32(*transitionFrames)
+			for frame := 0; frame < conf.FrameCount; frame++ {
+				ratio := float32(frame) / float32(conf.FrameCount)
 				color := lerp(left, right, ratio)
 				frameChannel <- color
 			}
