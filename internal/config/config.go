@@ -4,8 +4,8 @@ import "github.com/rs/zerolog"
 
 type Config struct {
 	RandomModel bool `default:"false"`
-	ImageWidth  int  `default:"1280"`
-	ImageHeight int  `default:"720"`
+	ImageWidth  int  `default:"1920"`
+	ImageHeight int  `default:"1080"`
 	FrameCount  int  `default:"90"`
 	StreamKey   string
 	DumpDir     string
