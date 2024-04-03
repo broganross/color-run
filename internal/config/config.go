@@ -1,7 +1,5 @@
 package config
 
-import "github.com/rs/zerolog"
-
 type Config struct {
 	RandomModel bool `default:"false"`
 	ImageWidth  int  `default:"1920"`
@@ -9,5 +7,5 @@ type Config struct {
 	FrameCount  int  `default:"90"`
 	StreamKey   string
 	DumpDir     string
-	LogLevel    zerolog.Level `default:"debug"`
+	LogLevel    string `default:"debug"`
 }

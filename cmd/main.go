@@ -50,13 +50,19 @@ func main() {
 	flag.BoolVar(&conf.RandomModel, "r", conf.RandomModel, "use a random color mind model")
 	flag.StringVar(&conf.StreamKey, "k", conf.StreamKey, "twitch stream key")
 	flag.StringVar(&conf.DumpDir, "d", conf.DumpDir, "dump frames to this directory as well as streaming")
+	flag.StringVar(&conf.LogLevel, "l", conf.LogLevel, "logging verbosity")
 	cpuProfile := flag.String("cpu-profile", "", "cpu profiling output path")
 	memProfile := flag.String("mem-profile", "", "memory profiling output path")
 	flag.Parse()
 	if conf.StreamKey == "" {
 		log.Fatal().Msg("stream key not set")
 	}
-	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	l, err := zerolog.ParseLevel(conf.LogLevel)
+	if err != nil {
+		log.Error().Err(err).Msg("parsing log level")
+		os.Exit(1)
+	}
+	zerolog.SetGlobalLevel(l)
 	if *cpuProfile != "" {
 		f, err := os.Create(*cpuProfile)
 		if err != nil {
